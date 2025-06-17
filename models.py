@@ -16,11 +16,6 @@ def create_users_table():
                     created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)
                 );
             """)
-            # Ensure admin user exists
-            cursor.execute("""
-                INSERT IGNORE INTO users (id, username, password, email, gender, dob)
-                VALUES (1, 'admin', 'admin', 'admin@example.com', 'other', '2000-01-01')
-            """)
             conn.commit()
         conn.close()
         print("✅ Users table and admin ensured.")
@@ -31,25 +26,25 @@ def create_chat_rooms_table():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
+            # Improved schema with clear comments
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chat_rooms (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255),
-                    created_by INT NOT NULL,
-                    is_group BOOLEAN DEFAULT FALSE,
-                    last_message_at DATETIME(6),
-                    created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
+                    id INT AUTO_INCREMENT PRIMARY KEY,         -- Unique room ID
+                    name VARCHAR(255),                         -- Room name (optional, for group/broadcast)
+                    created_by INT NOT NULL,                   -- User who created the room
+                    is_group BOOLEAN DEFAULT FALSE,            -- Group or private chat
+                    last_message_at DATETIME(6),               -- Last message timestamp
+                    created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6), -- Room creation time
                     FOREIGN KEY (created_by) REFERENCES users(id)
                 );
             """)
-            # Ensure room_id 0 exists for broadcast
+            # Ensure only one broadcast room exists (id=0)
             cursor.execute("INSERT IGNORE INTO chat_rooms (id, name, created_by, is_group) VALUES (0, 'Broadcast', 1, TRUE);")
             conn.commit()
         conn.close()
         print("✅ Chat rooms table ensured.")
     except Exception as e:
         print(f"❌ Error creating chat_rooms table: {e}")
-
 
 def create_room_participants_table():
     try:
@@ -86,6 +81,7 @@ def create_messages_table():
                     type ENUM('text', 'image', 'video', 'audio', 'file') DEFAULT 'text',
                     is_deleted BOOLEAN DEFAULT FALSE,
                     is_edited BOOLEAN DEFAULT FALSE,
+                    `read` BOOLEAN DEFAULT FALSE,  -- <-- Use backticks here
                     created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
                     FOREIGN KEY (room_id) REFERENCES chat_rooms(id),
                     FOREIGN KEY (sender_id) REFERENCES users(id),
@@ -99,7 +95,6 @@ def create_messages_table():
         print("✅ Messages table ensured.")
     except Exception as e:
         print(f"❌ Error creating messages table: {e}")
-
 
 def create_attachments_table():
     try:

@@ -1,7 +1,9 @@
 from flask import Blueprint, request
 from flask_socketio import SocketIO, emit
 from db import get_db_connection
-
+import redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+ONLINE_USERS_KEY = "online_users"
 connected_users = {}
 socket_io = SocketIO()  # Do NOT pass app here; do it in app.py
 ws_chat_bp = Blueprint('ws_chat', __name__)
@@ -12,8 +14,22 @@ def on_connect():
 
 @socket_io.on('disconnect')
 def on_disconnect():
-    print(f"User disconnected")
-
+    sid = request.sid
+    userid = None
+    for uid, user_sid in list(connected_users.items()):
+        if user_sid == sid:
+            userid = uid
+            del connected_users[uid]
+            break
+    if userid:
+        try:
+            redis_client.srem(ONLINE_USERS_KEY, userid)
+            # Broadcast updated online users list
+            online_users = list(redis_client.smembers(ONLINE_USERS_KEY))
+            emit('online_users', online_users, broadcast=True)
+        except redis.RedisError as re:
+            print(f"Redis error on disconnect: {re}")
+    print(f"User disconnected: {userid if userid else sid}")
 @socket_io.on('register')
 def handle_register(data):
     userid = data.get('userid') or data.get('id')
@@ -24,10 +40,18 @@ def handle_register(data):
         })
         return
     connected_users[userid] = request.sid
+    # Add user to Redis set with error handling
+    try:
+        redis_client.sadd(ONLINE_USERS_KEY, userid)
+    except redis.RedisError as re:
+        emit('register_response', {
+            "success": "false",
+            "message": f"Redis error: {str(re)}"
+        })
+        return
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # Update ws_id for the user with the given userid
             query = "UPDATE users SET ws_id = %s WHERE id = %s"
             cursor.execute(query, (request.sid, userid))
             conn.commit()
@@ -43,7 +67,12 @@ def handle_register(data):
                     "ws_id": request.sid
                 }
             })
-            emit('status', f"User {userid} joined the chat", broadcast=True)
+            # Broadcast updated online users list with error handling
+            try:
+                online_users = list(redis_client.smembers(ONLINE_USERS_KEY))
+                emit('online_users', online_users, broadcast=True)
+            except redis.RedisError as re:
+                print(f"Redis error during broadcast: {re}")
         else:
             emit('register_response', {
                 "success": "false",
@@ -54,7 +83,6 @@ def handle_register(data):
             "success": "false",
             "message": str(e)
         })
-
 @socket_io.on('chat')
 def handle_chat(data):
     try:
@@ -94,6 +122,10 @@ def save_message_to_db(sender_id, receiver_id, message):
                 INSERT INTO messages (room_id, sender_id, message)
                 VALUES (%s, %s, %s)
             """, (room_id, sender_id, message))
+            # Update last_message_at in chat_rooms
+            cursor.execute("""
+                UPDATE chat_rooms SET last_message_at = NOW(6) WHERE id = %s
+            """, (room_id,))
             conn.commit()
         conn.close()
     except Exception as e:
@@ -118,6 +150,81 @@ def get_or_create_private_room(sender_id, receiver_id, cursor):
         (%s, %s), (%s, %s)
     """, (new_room_id, user1, new_room_id, user2))
     return new_room_id
+
+
+@socket_io.on('create_group')
+def handle_create_group(data):
+    name = data.get('name')
+    created_by = data.get('created_by')
+    user_ids = data.get('user_ids')  # List of user IDs
+    if not name or not created_by or not user_ids or not isinstance(user_ids, list):
+        emit('create_group_response', {"success": False, "message": "Missing or invalid data"}, to=request.sid)
+        return
+    room_id = create_group_chat_room(name, created_by, user_ids)
+    emit('create_group_response', {"success": True, "room_id": room_id}, to=request.sid)
+def create_group_chat_room(name, created_by, user_ids):
+    """
+    name: Group name
+    created_by: User ID of creator
+    user_ids: List of user IDs to add (including creator)
+    """
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        # Create the group chat room
+        cursor.execute("""
+            INSERT INTO chat_rooms (name, created_by, is_group)
+            VALUES (%s, %s, TRUE)
+        """, (name, created_by))
+        room_id = cursor.lastrowid
+
+        # Add all users to room_participants
+        values = ','.join(['(%s, %s)'] * len(user_ids))
+        params = []
+        for uid in user_ids:
+            params.extend([room_id, uid])
+        cursor.execute(f"""
+            INSERT IGNORE INTO room_participants (room_id, user_id)
+            VALUES {values}
+        """, params)
+        conn.commit()
+    conn.close()
+    return room_id
+
+def add_user_to_group(room_id, user_id):
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            INSERT IGNORE INTO room_participants (room_id, user_id)
+            VALUES (%s, %s)
+        """, (room_id, user_id))
+        conn.commit()
+    conn.close()
+
+def handle_group_message(sender_id, room_id, message):
+    conn = get_db_connection()
+    with conn.cursor() as cursor:
+        # Store message
+        cursor.execute("""
+            INSERT INTO messages (room_id, sender_id, message)
+            VALUES (%s, %s, %s)
+        """, (room_id, sender_id, message))
+        # Update last_message_at
+        cursor.execute("""
+            UPDATE chat_rooms SET last_message_at = NOW(6) WHERE id = %s
+        """, (room_id,))
+        # Get all participants
+        cursor.execute("""
+            SELECT user_id FROM room_participants WHERE room_id = %s
+        """, (room_id,))
+        participants = [str(row['user_id']) for row in cursor.fetchall()]
+    conn.close()
+    # Emit to all connected users in the group
+    payload = {'from': sender_id, 'room_id': room_id, 'msg': message}
+    for uid in participants:
+        if uid in connected_users:
+            emit('chat', payload, to=connected_users[uid])
+
+
 
 @socket_io.on('mark_delivered')
 def handle_mark_delivered(data):

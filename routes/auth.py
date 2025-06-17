@@ -1,7 +1,10 @@
 from flask import Blueprint, request, jsonify
 from db import get_db_connection
 import pymysql
+import jwt
+import datetime
 
+SECRET_KEY = "your-very-secret-key"
 auth_bp = Blueprint('auth', __name__)
 
 @auth_bp.route('/register', methods=['POST'])
@@ -75,6 +78,7 @@ def verify_email_usage():
     except Exception as e:
         return jsonify({"success": "false", "message": str(e)}), 500
 
+
 @auth_bp.route('/auth', methods=['POST'])
 def login_credential():
     data = request.get_json()
@@ -98,12 +102,19 @@ def login_credential():
             conn.close()
 
             if result:
+                # Generate JWT token
+                payload = {
+                    'user_id': result['id'],
+                    'exp': datetime.datetime.utcnow() + datetime.timedelta(days=1)
+                }
+                token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
                 return jsonify({
                     "success": "true",
                     "message": "Login successful",
                     "content": {
                         "userid": result['id'],
-                        "username": result['username']
+                        "username": result['username'],
+                        "token": token
                     }
                 }), 200
             else:
